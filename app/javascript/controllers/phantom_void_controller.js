@@ -1,6 +1,9 @@
 import { Controller } from "@hotwired/stimulus";
 
 const PIXEL = 2;
+const MAX_PIXEL = 4;
+const FRAME_MS = 1000 / 30;
+const QUALITY_WINDOW_MS = 2000;
 const MAX_CLICKS = 6;
 const CLICK_LIFE_S = 2.5;
 const STILL_TIME_S = 12;
@@ -216,12 +219,31 @@ export default class extends Controller {
     this.mouseStrength = 0;
     this.hovering = false;
     this.clicks = [];
+    this.pixelSize = PIXEL;
+    this.layoutDirty = true;
+    this.clickAges = new Float32Array(MAX_CLICKS);
+    this.clickPositions = new Float32Array(MAX_CLICKS * 2);
+    this.invalidateLayout = () => {
+      this.layoutDirty = true;
+      if (this.gl && this.visible && !this.running) {
+        cancelAnimationFrame(this.staticFrame);
+        this.staticFrame = requestAnimationFrame(() => this.draw());
+      }
+    };
+    this.layoutObserver = new ResizeObserver(this.invalidateLayout);
+    for (const target of [
+      this.canvasTarget,
+      this.horizonTarget,
+      this.copyTarget,
+    ])
+      this.layoutObserver.observe(target);
     this.onVisibility = () => this.syncLoop();
     document.addEventListener("visibilitychange", this.onVisibility);
 
     this.observer = new IntersectionObserver(
       ([entry]) => {
         this.visible = entry.isIntersecting;
+        if (this.visible) this.invalidateLayout();
         if (this.visible && !this.gl) this.boot();
         this.syncLoop();
       },
@@ -232,8 +254,10 @@ export default class extends Controller {
 
   disconnect() {
     this.observer?.disconnect();
+    this.layoutObserver?.disconnect();
     document.removeEventListener("visibilitychange", this.onVisibility);
     cancelAnimationFrame(this.frame);
+    cancelAnimationFrame(this.staticFrame);
     this.running = false;
     this.gl?.getExtension("WEBGL_lose_context")?.loseContext();
     this.gl = null;
@@ -301,10 +325,12 @@ export default class extends Controller {
 
   track(e) {
     if (!this.interactive) return;
-    const { x, y } = this.toBuffer(e.clientX, e.clientY);
+    // Keep pointer/click coordinates in CSS pixels so quality changes cannot
+    // move an existing ripple. Scrolling only needs this one viewport read.
+    const { x, y } = this.pointerPosition(e.clientX, e.clientY);
     if (this.lastMove) {
       const dt = Math.max(0.001, (e.timeStamp - this.lastMove.at) / 1000);
-      const height = Math.max(1, this.canvasTarget.height);
+      const height = Math.max(1, this.layout?.height || 1);
       this.mouseVel.x = (x - this.lastMove.x) / height / dt;
       this.mouseVel.y = (y - this.lastMove.y) / height / dt;
     }
@@ -321,6 +347,8 @@ export default class extends Controller {
     if (shouldRun && !this.running) {
       this.running = true;
       this.lastTick = null;
+      this.nextDrawAt = null;
+      this.qualityElapsed = this.qualityFrames = this.healthyTime = 0;
       this.frame = requestAnimationFrame((t) => this.tick(t));
     } else if (!shouldRun && this.running) {
       this.running = false;
@@ -330,7 +358,13 @@ export default class extends Controller {
 
   tick(now) {
     if (!this.running || !this.gl) return;
-    const dt = this.lastTick ? Math.min(0.1, (now - this.lastTick) / 1000) : 0;
+    this.frame = requestAnimationFrame((t) => this.tick(t));
+    if (this.nextDrawAt != null && now + 0.1 < this.nextDrawAt) return;
+    const late = Math.max(0, now - (this.nextDrawAt ?? now));
+    this.nextDrawAt = now + FRAME_MS - (late % FRAME_MS);
+    const elapsed = this.lastTick == null ? 0 : now - this.lastTick;
+    if (elapsed > 0) this.adaptQuality(elapsed);
+    const dt = Math.min(0.1, elapsed / 1000);
     this.lastTick = now;
     this.time += dt;
 
@@ -342,41 +376,64 @@ export default class extends Controller {
     this.clicks = this.clicks.filter((click) => click.age < CLICK_LIFE_S);
 
     this.draw();
-    this.frame = requestAnimationFrame((t) => this.tick(t));
+  }
+
+  adaptQuality(elapsed) {
+    // Frame cadence includes GPU pressure and other page work; measuring the
+    // JS draw call alone would miss asynchronous shader execution. Use sustained
+    // slowdown, not a single hitch, and recover more slowly to avoid oscillation.
+    this.qualityElapsed += elapsed;
+    this.qualityFrames++;
+    if (this.qualityElapsed < QUALITY_WINDOW_MS) return;
+    const average = this.qualityElapsed / this.qualityFrames;
+    let pixelSize = this.pixelSize;
+    if (average > FRAME_MS * 1.35) {
+      pixelSize = Math.min(MAX_PIXEL, pixelSize + 1);
+      this.healthyTime = 0;
+    } else if (average < FRAME_MS * 1.12) {
+      this.healthyTime += this.qualityElapsed;
+      if (this.healthyTime >= QUALITY_WINDOW_MS * 4) {
+        pixelSize = Math.max(PIXEL, pixelSize - 1);
+        this.healthyTime = 0;
+      }
+    } else {
+      this.healthyTime = 0;
+    }
+    this.qualityElapsed = this.qualityFrames = 0;
+    if (pixelSize !== this.pixelSize) {
+      this.pixelSize = pixelSize;
+      this.layoutDirty = true;
+    }
   }
 
   draw() {
     const { gl, uniforms: u } = this;
-    this.resize();
+    if (!gl || !this.updateLayout()) return;
+    const { scaleX, scaleY, center, guard } = this.layout;
 
-    const ages = new Float32Array(MAX_CLICKS).fill(-1);
-    const positions = new Float32Array(MAX_CLICKS * 2);
+    const ages = this.clickAges;
+    const positions = this.clickPositions;
+    ages.fill(-1);
     this.clicks.forEach((click, i) => {
       ages[i] = click.age;
-      positions.set([click.x, click.y], i * 2);
+      positions[i * 2] = click.x * scaleX;
+      positions[i * 2 + 1] = click.y * scaleY;
     });
     const latest = this.clicks[this.clicks.length - 1];
 
     gl.uniform2f(u.u_res, gl.drawingBufferWidth, gl.drawingBufferHeight);
     gl.uniform1f(u.u_time, this.time);
-    const horizon = this.horizonTarget.getBoundingClientRect();
-    const center = this.toBuffer(
-      horizon.left + horizon.width / 2,
-      horizon.top + horizon.height / 2,
-    );
-    gl.uniform2f(u.u_center, center.x, center.y);
+    gl.uniform2f(u.u_center, center.x * scaleX, center.y * scaleY);
     gl.uniform1f(u.u_radius, this.radius);
     gl.uniform3fv(u.u_border, this.border);
-    const copy = this.copyTarget.getBoundingClientRect();
-    const corner = this.toBuffer(copy.left, copy.bottom);
     gl.uniform4f(
       u.u_guard,
-      corner.x,
-      corner.y,
-      copy.width / PIXEL,
-      copy.height / PIXEL,
+      guard.x * scaleX,
+      guard.y * scaleY,
+      guard.width * scaleX,
+      guard.height * scaleY,
     );
-    gl.uniform2f(u.u_mouse, this.mouse.x, this.mouse.y);
+    gl.uniform2f(u.u_mouse, this.mouse.x * scaleX, this.mouse.y * scaleY);
     gl.uniform2f(u.u_mvel, this.mouseVel.x, this.mouseVel.y);
     gl.uniform1f(u.u_mstr, this.mouseStrength);
     gl.uniform1f(u.u_pulse, latest ? latest.age : -1);
@@ -385,24 +442,49 @@ export default class extends Controller {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  toBuffer(clientX, clientY) {
+  pointerPosition(clientX, clientY) {
     const rect = this.canvasTarget.getBoundingClientRect();
     return {
-      x: (clientX - rect.left) / PIXEL,
-      y: (rect.bottom - clientY) / PIXEL,
+      x: clientX - rect.left,
+      y: rect.bottom - clientY,
     };
   }
 
-  resize() {
+  updateLayout() {
+    if (!this.layoutDirty) return !!this.layout;
     const canvas = this.canvasTarget;
-    const width = Math.max(1, Math.round(canvas.clientWidth / PIXEL));
-    const height = Math.max(1, Math.round(canvas.clientHeight / PIXEL));
-    if (canvas.width === width && canvas.height === height) return;
-    canvas.width = width;
-    canvas.height = height;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return false;
+    const horizon = this.horizonTarget.getBoundingClientRect();
+    const copy = this.copyTarget.getBoundingClientRect();
+    const width = Math.max(1, Math.round(rect.width / this.pixelSize));
+    const height = Math.max(1, Math.round(rect.height / this.pixelSize));
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+      this.gl.viewport(0, 0, width, height);
+    }
+    this.layout = {
+      width: rect.width,
+      height: rect.height,
+      scaleX: width / rect.width,
+      scaleY: height / rect.height,
+      center: {
+        x: horizon.left + horizon.width / 2 - rect.left,
+        y: rect.bottom - horizon.top - horizon.height / 2,
+      },
+      guard: {
+        x: copy.left - rect.left,
+        y: rect.bottom - copy.bottom,
+        width: copy.width,
+        height: copy.height,
+      },
+    };
     this.radius =
-      parseFloat(getComputedStyle(this.element).borderTopLeftRadius) / PIXEL;
-    this.gl.viewport(0, 0, width, height);
+      parseFloat(getComputedStyle(this.element).borderTopLeftRadius) *
+      this.layout.scaleX;
+    this.layoutDirty = false;
+    return true;
   }
 }
 
